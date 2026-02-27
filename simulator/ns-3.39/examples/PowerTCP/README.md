@@ -56,20 +56,21 @@ mkdir -p mix
 <sip_hex> <dip_hex> <sport> <dport> <size_bytes> <start_ns> <fct_ns> <standalone_fct_ns>
 ```
 
-*Packet captures* — one `.pcap` file per interface:
+*Packet captures* — two files, both on the switch:
 
-| File | Interface |
+| File | What you see |
 |---|---|
-| `mix/rdma-simple-0-1.pcap` | serverA NIC — outbound data, inbound ACKs |
-| `mix/rdma-simple-1-1.pcap` | serverB NIC — inbound data, outbound ACKs |
-| `mix/rdma-simple-2-1.pcap` | Switch port facing serverA |
-| `mix/rdma-simple-2-2.pcap` | Switch port facing serverB |
+| `mix/rdma-simple-2-1.pcap` | Switch transmitting **toward serverA** — ACKs, CNPs, PFC |
+| `mix/rdma-simple-2-2.pcap` | Switch transmitting **toward serverB** — RDMA Write data |
+
+> **Why only the switch?**  `QbbNetDevice::Receive()` on server (host) nodes dispatches RDMA packets (`ip.proto` 0x11/0xFC/0xFD/0xFE/0xFF) directly to the RDMA driver callback without calling `m_promiscSnifferTrace`.  RDMA TX on servers similarly calls `TransmitStart` directly from the RDMA queue dequeue path, also bypassing the sniffer.  The switch is the only place where `m_promiscSnifferTrace` fires for all RDMA packet types — it captures every packet the switch transmits out of each port.
 
 Inspect with tcpdump:
 ```bash
-tcpdump -r mix/rdma-simple-0-1.pcap -nn
+tcpdump -r mix/rdma-simple-2-2.pcap -nn   # data packets
+tcpdump -r mix/rdma-simple-2-1.pcap -nn   # ACKs and CNPs
 ```
-To disable pcap (faster runs), comment out the `qbb.EnablePcapAll` line in `rdma-simple-dcqcn.cc` or change `PCAP_PREFIX` to an empty string.
+To disable pcap (faster runs), comment out the two `qbb.EnablePcap` lines in `rdma-simple-dcqcn.cc`.
 
 **Wireshark dissector**
 
@@ -107,22 +108,22 @@ Set the matching mode in Wireshark via **Edit → Preferences → Protocols → 
 
 *Useful tshark one-liners after installing the plugin:*
 ```bash
-# Show only RDMA data packets with sequence numbers
+# Show RDMA data packets with sequence numbers (switch → serverB)
 tshark --lua-script rdma-ns3-dissector.lua \
-       -r mix/rdma-simple-0-1.pcap \
+       -r mix/rdma-simple-2-2.pcap \
        -Y "rdma_ns3_data" -T fields \
        -e ip.src -e ip.dst -e rdma_ns3_data.seq -e rdma_ns3_data.pg
 
-# Count CNPs (congestion signals sent by the switch)
+# Show ACKs and their sequence numbers (switch → serverA)
+tshark --lua-script rdma-ns3-dissector.lua \
+       -r mix/rdma-simple-2-1.pcap \
+       -Y "rdma_ns3_ack" -T fields \
+       -e rdma_ns3_ack.sport -e rdma_ns3_ack.seq
+
+# Show CNPs (congestion signals, switch → serverA)
 tshark --lua-script rdma-ns3-dissector.lua \
        -r mix/rdma-simple-2-1.pcap \
        -Y "rdma_ns3_cnp" -T fields -e ip.src -e rdma_ns3_cnp.ecnBits
-
-# Show all ACKs with sequence numbers
-tshark --lua-script rdma-ns3-dissector.lua \
-       -r mix/rdma-simple-1-1.pcap \
-       -Y "rdma_ns3_ack" -T fields \
-       -e rdma_ns3_ack.sport -e rdma_ns3_ack.seq
 ```
 
 **Tunable parameters** are constants at the top of `rdma-simple-dcqcn.cc`:

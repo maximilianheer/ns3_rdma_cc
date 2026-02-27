@@ -419,23 +419,28 @@ int main(int argc, char *argv[])
 #endif
 
     // -----------------------------------------------------------------------
-    // 11. Run
+    // 11. Enable pcap on the switch ports only.
+    //
+    // QbbNetDevice::Receive() for server (host) nodes dispatches RDMA packets
+    // (ip.proto 0x11/0xFC/0xFD/0xFE/0xFF) directly to m_rdmaReceiveCb without
+    // firing m_promiscSnifferTrace, so server-NIC pcap files would be empty.
+    // On the TX side, RDMA queue-pair dequeues (DequeueAndTransmit) also call
+    // TransmitStart directly, again bypassing the sniffer.
+    //
+    // Switch ports DO fire m_promiscSnifferTrace (line ~387 of qbb-net-device.cc)
+    // in DequeueAndTransmit, capturing every packet the switch transmits:
+    //   mix/rdma-simple-2-1.pcap  switch → serverA  (ACKs, CNPs, PFC)
+    //   mix/rdma-simple-2-2.pcap  switch → serverB  (RDMA data)
     // -----------------------------------------------------------------------
-    // -----------------------------------------------------------------------
-    // 11. Enable pcap on all interfaces
-    //     Files: mix/rdma-simple-<node>-<device>.pcap
-    //       node 0, dev 1 → serverA NIC (outbound data + inbound ACKs)
-    //       node 1, dev 1 → serverB NIC (inbound data + outbound ACKs)
-    //       node 2, dev 1 → switch port facing serverA
-    //       node 2, dev 2 → switch port facing serverB
-    // -----------------------------------------------------------------------
-    qbb.EnablePcapAll(PCAP_PREFIX, false);
+    qbb.EnablePcap(PCAP_PREFIX, dA.Get(1), false);   // switch port → serverA
+    qbb.EnablePcap(PCAP_PREFIX, dB.Get(1), false);   // switch port → serverB
 
     cout << "\nTopology : serverA ── 100G/1µs ── switch ── 100G/1µs ── serverB\n";
     cout << "CC mode  : DCQCN (cc_mode=" << CC_MODE << ")\n";
     cout << "Flow     : RDMA WRITE " << FLOW_SIZE_BYTES / 1e6 << " MB, serverA → serverB\n";
     cout << "Stop at  : " << SIM_STOP_S << " s\n";
-    cout << "PCAP     : " << PCAP_PREFIX << "-<node>-<dev>.pcap\n\n";
+    cout << "PCAP     : " << PCAP_PREFIX << "-2-1.pcap (ACKs/CNPs) | "
+         << PCAP_PREFIX << "-2-2.pcap (data)\n\n";
 
     Simulator::Stop(Seconds(SIM_STOP_S));
     Simulator::Run();

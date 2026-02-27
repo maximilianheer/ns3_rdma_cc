@@ -9,8 +9,17 @@
 --   Windows: copy to  %APPDATA%\Wireshark\plugins\
 --
 --   Or pass directly on the command line:
---     wireshark --lua-script rdma-ns3-dissector.lua -r mix/rdma-simple-0-1.pcap
---     tshark   --lua-script rdma-ns3-dissector.lua -r mix/rdma-simple-0-1.pcap
+--     wireshark --lua-script rdma-ns3-dissector.lua -r mix/rdma-simple-2-2.pcap
+--     tshark   --lua-script rdma-ns3-dissector.lua -r mix/rdma-simple-2-1.pcap
+--
+-- NOTE ON SERVER-NIC PCAP FILES
+--   QbbNetDevice::Receive() on host nodes dispatches RDMA packets directly to
+--   the RDMA driver callback (m_rdmaReceiveCb) without firing m_promiscSnifferTrace.
+--   RDMA TX likewise calls TransmitStart directly, bypassing the sniffer.
+--   Therefore server-NIC pcap files (node 0 / node 1) are always empty for RDMA
+--   traffic.  Only the SWITCH ports (node 2) produce useful captures:
+--     mix/rdma-simple-2-1.pcap  →  switch transmitting toward serverA (ACKs, CNPs, PFC)
+--     mix/rdma-simple-2-2.pcap  →  switch transmitting toward serverB (RDMA data)
 --
 -- PACKET FORMAT REFERENCE (CustomHeader.cc / IntHeader.cc)
 -- ─────────────────────────────────────────────────────────
