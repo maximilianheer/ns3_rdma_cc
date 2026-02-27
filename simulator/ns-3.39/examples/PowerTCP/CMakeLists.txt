@@ -37,4 +37,14 @@ build_example(
     ${libinternet}
     ${libapplications}
 )
+build_example(
+  NAME rdma-simple-dcqcn
+  SOURCE_FILES
+    rdma-simple-dcqcn.cc
+  LIBRARIES_TO_LINK
+    ${libpoint-to-point}
+    ${libtraffic-control}
+    ${libinternet}
+    ${libapplications}
+)
 set_source_files_properties(cdf.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
