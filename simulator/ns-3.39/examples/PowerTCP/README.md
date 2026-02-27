@@ -56,6 +56,29 @@ mkdir -p mix
 <sip_hex> <dip_hex> <sport> <dport> <size_bytes> <start_ns> <fct_ns> <standalone_fct_ns>
 ```
 
+*Congestion control state* — `mix/dcqcn-state.csv`, sampled every 5 µs on the sender:
+
+| Column | Description |
+|---|---|
+| `time_ns` | Simulation time (ns) |
+| `rate_bps` | Current sending rate (bps) |
+| `target_rate_bps` | DCQCN target rate (bps) |
+| `alpha` | Congestion estimate α ∈ [0, 1] — tracks ECN fraction via EWMA |
+| `rp_stage` | Rate-increase stage (0 = fast recovery, 1+ = active/hyper increase) |
+| `decrease_cnp` | 1 if a CNP arrived since the last rate-decrease check interval |
+| `alpha_cnp` | 1 if a CNP arrived in the current alpha-update slot |
+
+Quick plot with Python:
+```python
+import pandas as pd, matplotlib.pyplot as plt
+df = pd.read_csv("mix/dcqcn-state.csv")
+fig, axes = plt.subplots(3, 1, sharex=True)
+df.plot(x="time_ns", y="rate_bps",        ax=axes[0], legend=True)
+df.plot(x="time_ns", y="alpha",            ax=axes[1], legend=True)
+df.plot(x="time_ns", y="rp_stage",         ax=axes[2], legend=True)
+plt.xlabel("Time (ns)"); plt.tight_layout(); plt.savefig("dcqcn-state.png")
+```
+
 *Packet captures* — two files, both on the switch:
 
 | File | What you see |
@@ -137,3 +160,71 @@ tshark --lua-script rdma-ns3-dissector.lua \
 | `SWITCH_BUF_MB` | 4 | Switch buffer size (MB) |
 | `RP_TIMER` | 900 µs | DCQCN rate-increase timer |
 | `ALPHA_RESUME` | 55 | DCQCN alpha resume interval |
+
+## Incast DCQCN example
+
+`rdma-incast-dcqcn.cc` deliberately creates congestion so you can observe DCQCN rate reductions in the CSV output.  N senders (default 4) all write simultaneously to a single receiver over a shared 100 Gbps bottleneck link, providing 4× oversubscription.
+
+**Topology**
+```
+sender0 ─┐
+sender1 ─┼── switch ─── receiver
+sender2 ─┤
+sender3 ─┘
+(all links 100G / 1µs)
+```
+
+**What creates congestion:** 4 × 100 Gbps offered load into a 100 Gbps bottleneck → queue at the receiver-side switch port fills → ECN marking at Kmin (100 KB) → CNPs → DCQCN rate reduction on every sender.
+
+**Build and run** (from the `ns-3.39/` root):
+```bash
+mkdir -p mix
+./ns3 build rdma-incast-dcqcn
+./ns3 run rdma-incast-dcqcn
+```
+
+**Outputs**
+
+| File | Contents |
+|---|---|
+| `mix/fct-incast.txt` | FCT record, one line per completed flow |
+| `mix/dcqcn-incast.csv` | Per-sender DCQCN state, sampled every 5 µs |
+| `mix/rdma-incast-<sw>-<port>.pcap` | Switch pcap (receiver port + sender-0 port) |
+
+The CSV has one row per sender per sample interval:
+
+| Column | Description |
+|---|---|
+| `sender_id` | Which sender (0 … N_SENDERS−1) |
+| `time_ns` | Simulation time (ns) |
+| `rate_bps` | Current sending rate (bps) |
+| `target_rate_bps` | DCQCN target rate (bps) |
+| `alpha` | Congestion estimate α — rises toward 1 when CNPs arrive |
+| `rp_stage` | Rate-increase stage (0 = fast recovery, 1+ = active/hyper increase) |
+| `decrease_cnp` | 1 if a CNP arrived since the last rate-decrease check |
+| `alpha_cnp` | 1 if a CNP arrived in the current alpha-update slot |
+
+Quick plot with Python — showing all senders overlaid:
+```python
+import pandas as pd, matplotlib.pyplot as plt
+df = pd.read_csv("mix/dcqcn-incast.csv")
+fig, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 7))
+for sid, grp in df.groupby("sender_id"):
+    grp.plot(x="time_ns", y="rate_bps",   ax=axes[0], label=f"sender {sid}")
+    grp.plot(x="time_ns", y="alpha",       ax=axes[1], label=f"sender {sid}")
+    grp.plot(x="time_ns", y="rp_stage",    ax=axes[2], label=f"sender {sid}")
+for ax, title in zip(axes, ["Rate (bps)", "Alpha", "RP stage"]):
+    ax.set_ylabel(title); ax.legend(loc="upper right")
+plt.xlabel("Time (ns)"); plt.tight_layout()
+plt.savefig("dcqcn-incast.png", dpi=150)
+```
+
+**Tunable parameters** are constants at the top of `rdma-incast-dcqcn.cc`:
+
+| Constant | Default | Description |
+|---|---|---|
+| `N_SENDERS` | 4 | Number of competing senders |
+| `FLOW_SIZE_BYTES` | 10 000 000 | Size of each RDMA WRITE (bytes) |
+| `SIM_STOP_S` | 0.01 | Simulation stop time (10 ms is enough to see convergence) |
+| `KMIN_100G` / `KMAX_100G` | 100 / 400 KB | ECN thresholds (lower than simple example to fire quickly) |
+| `SWITCH_BUF_MB` | 32 | Large buffer prevents loss; ECN controls the rate instead |

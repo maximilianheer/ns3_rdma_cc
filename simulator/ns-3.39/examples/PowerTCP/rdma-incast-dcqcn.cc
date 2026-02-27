@@ -1,27 +1,38 @@
 /* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
 /*
- * Minimal RDMA-over-Converged-Ethernet simulation with DCQCN.
+ * DCQCN incast simulation – designed to produce visible congestion reactions.
  *
- * Topology:
- *   serverA (node 0) ── 100G/1µs ── switch (node 2) ── 100G/1µs ── serverB (node 1)
+ * Topology (N_SENDERS = 4 by default):
  *
- * One RDMA WRITE flow: serverA → serverB, 10 MB, starting at t=0.
- * Congestion control: DCQCN (cc_mode = 1).
- * PFC is enabled to provide a lossless fabric.
+ *   sender0 ─┐
+ *   sender1 ─┼── switch ─── receiver
+ *   sender2 ─┤
+ *   sender3 ─┘
+ *
+ * All links: 100 G / 1 µs.  N senders each write FLOW_SIZE_BYTES to the
+ * same receiver simultaneously, overloading the receiver-side link (total
+ * offered load = N × 100 Gbps into a single 100 Gbps bottleneck).
+ *
+ * ECN marking at the switch triggers CNPs which drive DCQCN rate reduction
+ * on every sender.  The DCQCN state (rate, alpha, stage …) is sampled every
+ * DCQCN_SAMPLE_NS ns for all senders and written to mix/dcqcn-incast.csv.
  *
  * Build:
- *   ./ns3 build rdma-simple-dcqcn
+ *   ./ns3 build rdma-incast-dcqcn
  *
  * Run (from the ns-3.39 root):
  *   mkdir -p mix
- *   ./ns3 run rdma-simple-dcqcn
+ *   ./ns3 run rdma-incast-dcqcn
  *
- * Output:
- *   mix/fct-simple.txt  – per-flow completion time record
+ * Outputs:
+ *   mix/fct-incast.txt        – one line per completed flow
+ *   mix/dcqcn-incast.csv      – per-sender DCQCN state over time
+ *   mix/rdma-incast-<n>-<d>.pcap
  */
 
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <vector>
 #include "ns3/core-module.h"
 #include "ns3/qbb-helper.h"
@@ -40,18 +51,19 @@
 using namespace ns3;
 using namespace std;
 
-NS_LOG_COMPONENT_DEFINE("RDMA_SIMPLE_DCQCN");
+NS_LOG_COMPONENT_DEFINE("RDMA_INCAST_DCQCN");
 
 // ---------------------------------------------------------------------------
-// Simulation parameters – tweak here or extend with CommandLine as needed
+// Simulation parameters – tweak here
 // ---------------------------------------------------------------------------
 const uint32_t CC_MODE         = 1;          // 1 = DCQCN
+const uint32_t N_SENDERS       = 4;          // fan-in; total offered load = N × 100 Gbps
 const uint32_t PACKET_PAYLOAD  = 1000;        // bytes per RDMA packet
 const double   PAUSE_TIME      = 5;           // PFC pause quantum (µs)
-const double   SIM_STOP_S      = 0.05;        // simulation stop time (s)
-const uint64_t FLOW_SIZE_BYTES = 10000000;    // 10 MB RDMA WRITE
+const double   SIM_STOP_S      = 0.01;        // 10 ms is enough to see DCQCN converge
+const uint64_t FLOW_SIZE_BYTES = 10000000;    // 10 MB per sender
 
-// DCQCN knobs (same defaults as HPCC / PowerTCP code-base)
+// DCQCN knobs
 const double   ALPHA_RESUME    = 55;
 const double   RP_TIMER        = 900;         // µs
 const double   EWMA_GAIN       = 1.0 / 16;
@@ -59,22 +71,26 @@ const uint32_t FAST_RECOV      = 5;
 const double   RATE_DEC_INTV   = 4;
 
 // ECN thresholds for 100 Gbps links
-const uint32_t KMIN_100G       = 400;         // KB
-const uint32_t KMAX_100G       = 1600;        // KB
+// Kmin = 100 KB so ECN fires quickly under 4× overload
+const uint32_t KMIN_100G       = 100;         // KB  (lower than simple example)
+const uint32_t KMAX_100G       = 400;         // KB
 const double   PMAX_100G       = 0.2;
-const uint32_t SWITCH_BUF_MB   = 4;
+const uint32_t SWITCH_BUF_MB   = 32;          // large buffer → no loss, pure DCQCN
 
 // Output files
-const std::string FCT_FILE       = "mix/fct-simple.txt";
-const std::string PCAP_PREFIX    = "mix/rdma-simple";  // produces mix/rdma-simple-<node>-<dev>.pcap
-const std::string DCQCN_LOG_FILE = "mix/dcqcn-state.csv"; // sender-side CC state over time
-const uint64_t    DCQCN_SAMPLE_NS = 5000;               // sampling period (5 µs)
+const std::string FCT_FILE       = "mix/fct-incast.txt";
+const std::string PCAP_PREFIX    = "mix/rdma-incast";
+const std::string DCQCN_LOG_FILE = "mix/dcqcn-incast.csv";
+const uint64_t    DCQCN_SAMPLE_NS = 5000;     // sample every 5 µs
 
 // ---------------------------------------------------------------------------
-// Global state (mirrors the original HPCC/PowerTCP simulation structure)
+// Global state
 // ---------------------------------------------------------------------------
-NodeContainer n;  // n[0]=serverA, n[1]=serverB, n[2]=switch
-std::vector<Ipv4Address> serverAddress;
+// Node layout:  n[0..N_SENDERS-1] = senders
+//               n[N_SENDERS]      = receiver
+//               n[N_SENDERS+1]    = switch  (SwitchNode)
+NodeContainer n;
+std::vector<Ipv4Address> serverAddress;  // [0..N_SENDERS-1]=senders, [N_SENDERS]=receiver
 
 struct Interface {
     uint32_t idx;
@@ -93,7 +109,8 @@ map<Ptr<Node>, map<Ptr<Node>, uint64_t>>             pairBdp;
 map<uint32_t,  map<uint32_t,  uint64_t>>             pairRtt;
 
 uint64_t maxRtt = 0, maxBdp = 0;
-FILE    *dcqcn_log = nullptr;
+FILE    *dcqcn_log  = nullptr;
+FILE    *fct_output = nullptr;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -124,7 +141,6 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q)
 
     uint64_t standalone_fct = base_rtt + total_bytes * 8000000000lu / b;
 
-    // sip dip sport dport size(B) start_time(ns) fct(ns) standalone_fct(ns)
     fprintf(fout, "%08x %08x %u %u %lu %lu %lu %lu\n",
             q->sip.Get(), q->dip.Get(),
             q->sport, q->dport,
@@ -134,12 +150,13 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q)
             standalone_fct);
     fflush(fout);
 
+    // Clean up the receiver-side RX QP.
     Ptr<RdmaDriver> rdma = n.Get(did)->GetObject<RdmaDriver>();
     rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
 }
 
 // ---------------------------------------------------------------------------
-// Routing (copied verbatim from powertcp-evaluation-burst.cc)
+// Routing (same as rdma-simple-dcqcn.cc)
 // ---------------------------------------------------------------------------
 void CalculateRoute(Ptr<Node> host)
 {
@@ -199,37 +216,45 @@ void SetRoutingEntries()
 }
 
 // ---------------------------------------------------------------------------
-// Periodic DCQCN sender-state logger
+// Periodic DCQCN state logger – samples all N senders each interval.
 //
-// Samples the single sender QP every DCQCN_SAMPLE_NS nanoseconds and appends
-// one CSV row to dcqcn_log:
+// CSV columns:
+//   sender_id        – which sender (0 .. N_SENDERS-1)
 //   time_ns          – simulation time (ns)
 //   rate_bps         – current sending rate (bps)
 //   target_rate_bps  – DCQCN target rate (bps)
-//   alpha            – DCQCN alpha (congestion estimate, 0–1)
-//   rp_stage         – rate-increase stage (0=fast-recovery, 1..N=active/hyper increase)
-//   decrease_cnp     – 1 if a CNP arrived since the last rate-decrease check
-//   alpha_cnp        – 1 if a CNP arrived in the current alpha-update slot
+//   alpha            – congestion estimate α ∈ [0,1]
+//   rp_stage         – rate-increase stage (0=fast-recovery, 1+=active/hyper)
+//   decrease_cnp     – 1 if CNP arrived since last rate-decrease check
+//   alpha_cnp        – 1 if CNP arrived in current alpha-update slot
 // ---------------------------------------------------------------------------
 void LogDcqcnState()
 {
-    Ptr<RdmaDriver>    rdmaA = n.Get(0)->GetObject<RdmaDriver>();
-    // Identify the QP by (dip, sport, pg) — same values used in RdmaClientHelper.
-    Ptr<RdmaQueuePair> qp    = rdmaA->m_rdma->GetQp(serverAddress[1].Get(), 10000, 3);
-    if (qp == nullptr) return;  // QP was removed after flow completion
+    bool any_active = false;
+    Ipv4Address receiverAddr = serverAddress[N_SENDERS];
 
-    fprintf(dcqcn_log,
-            "%lu,%lu,%lu,%.6f,%u,%d,%d\n",
-            Simulator::Now().GetNanoSeconds(),
-            qp->m_rate.GetBitRate(),
-            qp->mlx.m_targetRate.GetBitRate(),
-            qp->mlx.m_alpha,
-            qp->mlx.m_rpTimeStage,
-            (int)qp->mlx.m_decrease_cnp_arrived,
-            (int)qp->mlx.m_alpha_cnp_arrived);
+    for (uint32_t i = 0; i < N_SENDERS; i++) {
+        Ptr<RdmaDriver>    rdmaS = n.Get(i)->GetObject<RdmaDriver>();
+        // All senders use sport=10000, pg=3; each has its own RdmaHw instance
+        // so there is no key collision even though dip and sport are the same.
+        Ptr<RdmaQueuePair> qp   = rdmaS->m_rdma->GetQp(receiverAddr.Get(), 10000, 3);
+        if (qp == nullptr) continue;  // QP removed after flow completion
+        any_active = true;
+
+        fprintf(dcqcn_log,
+                "%u,%lu,%lu,%lu,%.6f,%u,%d,%d\n",
+                i,
+                Simulator::Now().GetNanoSeconds(),
+                qp->m_rate.GetBitRate(),
+                qp->mlx.m_targetRate.GetBitRate(),
+                qp->mlx.m_alpha,
+                qp->mlx.m_rpTimeStage,
+                (int)qp->mlx.m_decrease_cnp_arrived,
+                (int)qp->mlx.m_alpha_cnp_arrived);
+    }
     fflush(dcqcn_log);
 
-    if (!qp->IsFinished())
+    if (any_active)
         Simulator::Schedule(NanoSeconds(DCQCN_SAMPLE_NS), LogDcqcnState);
 }
 
@@ -241,25 +266,24 @@ int main(int argc, char *argv[])
     // -----------------------------------------------------------------------
     // 1. CC-mode global config
     // -----------------------------------------------------------------------
-    // DCQCN uses no INT header, so set mode to NONE.
-    IntHeader::mode = IntHeader::NONE;
+    IntHeader::mode = IntHeader::NONE;  // DCQCN uses no INT header
 
     Config::SetDefault("ns3::QbbNetDevice::PauseTime",  UintegerValue(PAUSE_TIME));
     Config::SetDefault("ns3::QbbNetDevice::QcnEnabled", BooleanValue(true));
 
     // -----------------------------------------------------------------------
     // 2. Create nodes
-    //    Index 0 = serverA (sender), 1 = serverB (receiver), 2 = switch
+    //    n[0 .. N_SENDERS-1] = senders
+    //    n[N_SENDERS]        = receiver
+    //    n[N_SENDERS+1]      = switch
     // -----------------------------------------------------------------------
-    Ptr<Node>       serverA = CreateObject<Node>();
-    Ptr<Node>       serverB = CreateObject<Node>();
-    Ptr<SwitchNode> sw      = CreateObject<SwitchNode>();
+    for (uint32_t i = 0; i < N_SENDERS; i++)
+        n.Add(CreateObject<Node>());   // senders
+    n.Add(CreateObject<Node>());       // receiver
 
+    Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
     sw->SetAttribute("EcnEnabled", BooleanValue(true));
-    sw->SetNodeType(1);   // 1 = ToR switch
-
-    n.Add(serverA);
-    n.Add(serverB);
+    sw->SetNodeType(1);
     n.Add(sw);
 
     InternetStackHelper internet;
@@ -267,11 +291,10 @@ int main(int argc, char *argv[])
     internet.SetRoutingHelper(globalRoutingHelper);
     internet.Install(n);
 
-    // Pre-assign server IPs (before link installation, so they become the
-    // primary addresses used by the RDMA stack).
-    serverAddress.resize(2);
-    serverAddress[0] = node_id_to_ip(0);
-    serverAddress[1] = node_id_to_ip(1);
+    // Pre-assign RDMA addresses for all servers.
+    serverAddress.resize(N_SENDERS + 1);
+    for (uint32_t i = 0; i <= N_SENDERS; i++)
+        serverAddress[i] = node_id_to_ip(i);
 
     // -----------------------------------------------------------------------
     // 3. Install 100G links
@@ -282,29 +305,7 @@ int main(int argc, char *argv[])
 
     Ipv4AddressHelper ipv4Hlp;
 
-    // Link A: serverA ── switch
-    NetDeviceContainer dA = qbb.Install(serverA, sw);
-    {
-        Ptr<Ipv4> ip = serverA->GetObject<Ipv4>();
-        ip->AddInterface(dA.Get(0));
-        ip->AddAddress(1, Ipv4InterfaceAddress(serverAddress[0], Ipv4Mask(0xff000000)));
-    }
-    ipv4Hlp.SetBase("10.1.1.0", "255.255.255.0");
-    ipv4Hlp.Assign(dA);
-
-    // Link B: serverB ── switch
-    NetDeviceContainer dB = qbb.Install(serverB, sw);
-    {
-        Ptr<Ipv4> ip = serverB->GetObject<Ipv4>();
-        ip->AddInterface(dB.Get(0));
-        ip->AddAddress(1, Ipv4InterfaceAddress(serverAddress[1], Ipv4Mask(0xff000000)));
-    }
-    ipv4Hlp.SetBase("10.1.2.0", "255.255.255.0");
-    ipv4Hlp.Assign(dB);
-
-    // -----------------------------------------------------------------------
-    // 4. Populate nbr2if (needed by routing and BDP computation)
-    // -----------------------------------------------------------------------
+    // Helper lambda – populate nbr2if for a just-installed link.
     auto registerLink = [&](NetDeviceContainer &d, Ptr<Node> a, Ptr<Node> b) {
         Ptr<QbbNetDevice> devA = DynamicCast<QbbNetDevice>(d.Get(0));
         Ptr<QbbNetDevice> devB = DynamicCast<QbbNetDevice>(d.Get(1));
@@ -321,14 +322,38 @@ int main(int argc, char *argv[])
         nbr2if[b][a] = ifB;
     };
 
-    registerLink(dA, serverA, sw);
-    registerLink(dB, serverB, sw);
+    // sender_i ── switch links
+    std::vector<NetDeviceContainer> dSenders(N_SENDERS);
+    for (uint32_t i = 0; i < N_SENDERS; i++) {
+        dSenders[i] = qbb.Install(n.Get(i), sw);
+        {
+            Ptr<Ipv4> ip = n.Get(i)->GetObject<Ipv4>();
+            ip->AddInterface(dSenders[i].Get(0));
+            ip->AddAddress(1, Ipv4InterfaceAddress(serverAddress[i], Ipv4Mask(0xff000000)));
+        }
+        std::ostringstream base;
+        base << "10.1." << (i + 1) << ".0";
+        ipv4Hlp.SetBase(base.str().c_str(), "255.255.255.0");
+        ipv4Hlp.Assign(dSenders[i]);
+        registerLink(dSenders[i], n.Get(i), sw);
+    }
+
+    // receiver ── switch link
+    NetDeviceContainer dReceiver = qbb.Install(n.Get(N_SENDERS), sw);
+    {
+        Ptr<Ipv4> ip = n.Get(N_SENDERS)->GetObject<Ipv4>();
+        ip->AddInterface(dReceiver.Get(0));
+        ip->AddAddress(1, Ipv4InterfaceAddress(serverAddress[N_SENDERS], Ipv4Mask(0xff000000)));
+    }
+    ipv4Hlp.SetBase("10.1.100.0", "255.255.255.0");
+    ipv4Hlp.Assign(dReceiver);
+    registerLink(dReceiver, n.Get(N_SENDERS), sw);
 
     // -----------------------------------------------------------------------
-    // 5. Configure switch MMU (Dynamic Thresholds + ECN)
+    // 4. Configure switch MMU (Dynamic Thresholds + ECN)
     // -----------------------------------------------------------------------
     {
-        Ptr<QbbNetDevice> refDev = DynamicCast<QbbNetDevice>(dA.Get(0));
+        Ptr<QbbNetDevice> refDev = DynamicCast<QbbNetDevice>(dSenders[0].Get(0));
         uint64_t link_bps    = refDev->GetDataRate().GetBitRate();
         uint64_t link_dly_ns =
             DynamicCast<QbbChannel>(refDev->GetChannel())->GetDelay().GetTimeStep();
@@ -353,10 +378,10 @@ int main(int argc, char *argv[])
     }
 
     // -----------------------------------------------------------------------
-    // 6. Install RDMA driver on servers
+    // 5. Install RDMA driver on all servers (senders + receiver)
     // -----------------------------------------------------------------------
 #if ENABLE_QP
-    FILE *fct_output = fopen(FCT_FILE.c_str(), "w");
+    fct_output = fopen(FCT_FILE.c_str(), "w");
     NS_ASSERT_MSG(fct_output, "Could not open " << FCT_FILE
                   << " – make sure the 'mix/' directory exists.");
 
@@ -384,7 +409,6 @@ int main(int argc, char *argv[])
         rdmaHw->SetAttribute("TargetUtil",           DoubleValue(0.95));
         rdmaHw->SetAttribute("RateBound",            BooleanValue(true));
         rdmaHw->SetAttribute("DctcpRateAI",          DataRateValue(DataRate("1000Mb/s")));
-        // PowerTCP/Theta-PowerTCP are disabled; this is pure DCQCN.
         rdmaHw->SetAttribute("PowerTCPEnabled",      BooleanValue(false));
         rdmaHw->SetAttribute("PowerTCPdelay",        BooleanValue(false));
         rdmaHw->SetPintSmplThresh(1.0);
@@ -398,40 +422,38 @@ int main(int argc, char *argv[])
                                          MakeBoundCallback(qp_finish, fct_output));
     };
 
-    installRdma(serverA);
-    installRdma(serverB);
+    for (uint32_t i = 0; i <= N_SENDERS; i++)
+        installRdma(n.Get(i));
 #endif
 
-    // ACKs go in low-priority queue 3
     RdmaEgressQueue::ack_q_idx = 3;
 
     // -----------------------------------------------------------------------
-    // 7. Routing
+    // 6. Routing
     // -----------------------------------------------------------------------
     CalculateRoutes();
     SetRoutingEntries();
 
     // -----------------------------------------------------------------------
-    // 8. Compute BDP / RTT for the single server pair
+    // 7. Compute BDP / RTT for all sender → receiver pairs
     // -----------------------------------------------------------------------
-    for (uint32_t i = 0; i < 2; i++) {
-        for (uint32_t j = 0; j < 2; j++) {
-            if (i == j) continue;
-            uint64_t delay   = pairDelay[n.Get(i)][n.Get(j)];
-            uint64_t txDelay = pairTxDelay[n.Get(i)][n.Get(j)];
-            uint64_t rtt     = delay * 2 + txDelay;
-            uint64_t bw      = pairBw[i][j];
-            uint64_t bdp     = rtt * bw / 1000000000 / 8;
-            pairBdp[n.Get(i)][n.Get(j)] = bdp;
-            pairRtt[i][j] = rtt;
-            if (bdp > maxBdp) maxBdp = bdp;
-            if (rtt > maxRtt) maxRtt = rtt;
-        }
+    Ptr<Node> receiver = n.Get(N_SENDERS);
+    for (uint32_t i = 0; i < N_SENDERS; i++) {
+        Ptr<Node> sender = n.Get(i);
+        uint64_t delay   = pairDelay[sender][receiver];
+        uint64_t txDelay = pairTxDelay[sender][receiver];
+        uint64_t rtt     = delay * 2 + txDelay;
+        uint64_t bw      = pairBw[i][N_SENDERS];
+        uint64_t bdp     = rtt * bw / 1000000000 / 8;
+        pairBdp[sender][receiver] = bdp;
+        pairRtt[i][N_SENDERS] = rtt;
+        if (bdp > maxBdp) maxBdp = bdp;
+        if (rtt > maxRtt) maxRtt = rtt;
     }
     printf("maxRtt=%lu ns   maxBdp=%lu bytes\n", maxRtt, maxBdp);
 
     // -----------------------------------------------------------------------
-    // 9. Configure switch CC
+    // 8. Configure switch CC
     // -----------------------------------------------------------------------
     sw->SetAttribute("CcMode",       UintegerValue(CC_MODE));
     sw->SetAttribute("MaxRtt",       UintegerValue(maxRtt));
@@ -440,67 +462,61 @@ int main(int argc, char *argv[])
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
     // -----------------------------------------------------------------------
-    // 10. Install the single RDMA WRITE flow: serverA → serverB
+    // 9. Install flows: all senders → receiver, start simultaneously
     // -----------------------------------------------------------------------
 #if ENABLE_QP
-    RdmaClientHelper clientHelper(
-        3,                // priority group (RDMA uses PG 3)
-        serverAddress[0], serverAddress[1],
-        10000,            // source port
-        10000,            // destination port
-        FLOW_SIZE_BYTES,  // bytes to write
-        maxBdp,           // window = BDP (bytes)
-        maxRtt,           // base RTT (ns)
-        Simulator::GetMaximumSimulationTime()
-    );
-    ApplicationContainer app = clientHelper.Install(serverA);
-    app.Start(Seconds(0.0));
+    for (uint32_t i = 0; i < N_SENDERS; i++) {
+        RdmaClientHelper clientHelper(
+            3,                        // priority group
+            serverAddress[i],         // source IP
+            serverAddress[N_SENDERS], // destination IP (receiver)
+            10000,                    // source port  (same on all senders – each
+            10000,                    // dest port     has its own RdmaHw instance)
+            FLOW_SIZE_BYTES,
+            maxBdp,
+            maxRtt,
+            Simulator::GetMaximumSimulationTime()
+        );
+        ApplicationContainer app = clientHelper.Install(n.Get(i));
+        app.Start(Seconds(0.0));
+    }
 #endif
 
     // -----------------------------------------------------------------------
-    // 11. Enable pcap on the switch ports only.
+    // 10. Pcap on key switch ports
     //
-    // QbbNetDevice::Receive() for server (host) nodes dispatches RDMA packets
-    // (ip.proto 0x11/0xFC/0xFD/0xFE/0xFF) directly to m_rdmaReceiveCb without
-    // firing m_promiscSnifferTrace, so server-NIC pcap files would be empty.
-    // On the TX side, RDMA queue-pair dequeues (DequeueAndTransmit) also call
-    // TransmitStart directly, again bypassing the sniffer.
-    //
-    // Switch ports DO fire m_promiscSnifferTrace (line ~387 of qbb-net-device.cc)
-    // in DequeueAndTransmit, capturing every packet the switch transmits:
-    //   mix/rdma-simple-2-1.pcap  switch → serverA  (ACKs, CNPs, PFC)
-    //   mix/rdma-simple-2-2.pcap  switch → serverB  (RDMA data)
+    // switch → receiver port  (data from all senders; ECN-marked packets)
+    // switch → sender0 port   (CNPs and ACKs flowing back to sender 0)
     // -----------------------------------------------------------------------
-    qbb.EnablePcap(PCAP_PREFIX, dA.Get(1), false);   // switch port → serverA
-    qbb.EnablePcap(PCAP_PREFIX, dB.Get(1), false);   // switch port → serverB
+    qbb.EnablePcap(PCAP_PREFIX, dReceiver.Get(1),   false);  // switch → receiver
+    qbb.EnablePcap(PCAP_PREFIX, dSenders[0].Get(1), false);  // switch → sender 0
 
     // -----------------------------------------------------------------------
-    // 12. DCQCN congestion-state logger
+    // 11. DCQCN congestion-state logger
     // -----------------------------------------------------------------------
 #if ENABLE_QP
     dcqcn_log = fopen(DCQCN_LOG_FILE.c_str(), "w");
     NS_ASSERT_MSG(dcqcn_log, "Could not open " << DCQCN_LOG_FILE
                   << " – make sure the 'mix/' directory exists.");
     fprintf(dcqcn_log,
-            "time_ns,rate_bps,target_rate_bps,alpha,rp_stage,decrease_cnp,alpha_cnp\n");
-    // First sample after one interval so the QP is guaranteed to be in m_qpMap.
+            "sender_id,time_ns,rate_bps,target_rate_bps,alpha,rp_stage,decrease_cnp,alpha_cnp\n");
     Simulator::Schedule(NanoSeconds(DCQCN_SAMPLE_NS), LogDcqcnState);
 #endif
 
-    cout << "\nTopology : serverA ── 100G/1µs ── switch ── 100G/1µs ── serverB\n";
+    cout << "\nTopology : " << N_SENDERS << " senders ── 100G/1µs ── switch ── 100G/1µs ── receiver\n";
     cout << "CC mode  : DCQCN (cc_mode=" << CC_MODE << ")\n";
-    cout << "Flow     : RDMA WRITE " << FLOW_SIZE_BYTES / 1e6 << " MB, serverA → serverB\n";
+    cout << "Flows    : " << N_SENDERS << " × " << FLOW_SIZE_BYTES / 1e6
+         << " MB (all start at t=0, " << (double)N_SENDERS * 100 << " Gbps offered → 100 Gbps bottleneck)\n";
+    cout << "ECN      : Kmin=" << KMIN_100G << " KB  Kmax=" << KMAX_100G << " KB\n";
     cout << "Stop at  : " << SIM_STOP_S << " s\n";
-    cout << "PCAP     : " << PCAP_PREFIX << "-2-1.pcap (ACKs/CNPs) | "
-         << PCAP_PREFIX << "-2-2.pcap (data)\n";
-    cout << "CC log   : " << DCQCN_LOG_FILE << " (sampled every "
-         << DCQCN_SAMPLE_NS << " ns)\n\n";
+    cout << "CC log   : " << DCQCN_LOG_FILE << " (sampled every " << DCQCN_SAMPLE_NS << " ns)\n\n";
 
     Simulator::Stop(Seconds(SIM_STOP_S));
     Simulator::Run();
     Simulator::Destroy();
 
-    if (dcqcn_log) fclose(dcqcn_log);
+    if (dcqcn_log)  fclose(dcqcn_log);
+    if (fct_output) fclose(fct_output);
 
     cout << "\nDone. FCT results: " << FCT_FILE
          << "\n     CC log:       " << DCQCN_LOG_FILE << "\n";
